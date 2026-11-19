@@ -1,0 +1,27 @@
+[package]
+name = "agent-module-checklist"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "任务清单模块（echo-agent.checklist）：checklist 工具、per-persona 持久 store、权威快照补拉与提示词摘要"
+
+[dependencies]
+echo-module = { workspace = true }
+echo-context = { workspace = true }
+echo-defs = { workspace = true }
+agent-module-management = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# 假脱敏器（`FakeRedactor`）：测试里要验证"机器字段保留 / 用户内容脱敏"时，
+# 不自带一份实现——宿主与模块共用同一份夹具，行为不会分叉。
+echo-test-utils = { git = "https://github.com/EchoLab-Auto/EchoAgentCore", branch = "main" }
+# 本机联调时改成：echo-test-utils = { path = "/path/to/EchoAgentCore/source/test/utils" }

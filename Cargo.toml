@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = ["crates/agent-module-checklist"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.98"
+license = "MIT"
+repository = "https://github.com/EchoLab-Auto/agent-module-checklist"
+
+# 只列通用第三方库 + 上游 Echo 仓依赖。本仓不含任何宿主应用代码。
+[workspace.dependencies]
+# 框架仓（模块 trait / mount 上下文 / 服务定位）。与 EchoAgentCore 根 Cargo.toml
+# 保持同一 tag，避免同一进程里出现两份框架类型（`Box<dyn Module>` 不跨版本兼容）。
+echo-module = { git = "https://github.com/EchoLab-Auto/echo-fabric-arch", tag = "v0.18.0" }
+echo-context = { git = "https://github.com/EchoLab-Auto/echo-fabric-arch", tag = "v0.18.0" }
+
+# Core 基础 crate（工具 / 脱敏词汇、面板协议形状）。与 Core 保持同一分支——
+# 宿主会把这几个 crate 以 path 形式 patch 回本地工作区，两边必须同源，否则同一
+# 进程里会出现两份 `Tool` trait（`Box<dyn Tool>` 不跨版本兼容）。
+echo-defs = { git = "https://github.com/EchoLab-Auto/EchoAgentCore", branch = "main" }
+agent-module-management = { git = "https://github.com/EchoLab-Auto/EchoAgentCore", branch = "main" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt", "sync", "macros", "time", "fs", "io-util"] }
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+async-trait = "0.1"
+
+# ── 本机联调（可选）────────────────────────────────────────────────────
+#
+# 上游 Core 的清单相关协议（`RequestChecklists` / `ChecklistsSnapshot` /
+# `ChecklistSnapshotEntry` / `Tool::snapshot_machine_fields`）尚未合入 `main`
+# 时，本仓独立 `cargo test` 会因"找不到变体"而失败。此时把下面这段插到
+# `[workspace]` 之上，用本机 Core 工作区顶掉 git 版本：
+#
+# [patch."https://github.com/EchoLab-Auto/EchoAgentCore"]
+# echo-defs = { path = "/path/to/EchoAgentCore/source/modules/echo-defs" }
+# agent-module-management = { path = "/path/to/EchoAgentCore/source/modules/agent-module-management" }
+# echo-test-utils = { path = "/path/to/EchoAgentCore/source/test/utils" }
