@@ -13,9 +13,9 @@ repository = "https://github.com/EchoLab-Auto/agent-module-checklist"
 [workspace.dependencies]
 # 框架仓（模块 trait / mount 上下文 / 服务定位）。与 EchoAgentCore 根 Cargo.toml
 # 保持同一 tag，避免同一进程里出现两份框架类型（`Box<dyn Module>` 不跨版本兼容）。
-echo-module = { git = "https://github.com/EchoLab-Auto/echo-fabric-arch", tag = "v0.19.0" }
-echo-context = { git = "https://github.com/EchoLab-Auto/echo-fabric-arch", tag = "v0.19.0" }
-echo-module-sdk = { git = "https://github.com/EchoLab-Auto/echo-fabric-arch", tag = "v0.19.0" }
+echo-module = { git = "https://github.com/EchoLab-Auto/echo-fabric-arch", tag = "v0.19.1" }
+echo-context = { git = "https://github.com/EchoLab-Auto/echo-fabric-arch", tag = "v0.19.1" }
+echo-module-sdk = { git = "https://github.com/EchoLab-Auto/echo-fabric-arch", tag = "v0.19.1" }
 
 # Core 基础 crate（工具 / 脱敏词汇、面板协议形状）。与 Core 保持同一分支——
 # 宿主会把这几个 crate 以 path 形式 patch 回本地工作区，两边必须同源，否则同一
