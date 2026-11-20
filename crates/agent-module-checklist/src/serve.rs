@@ -30,7 +30,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use echo_defs::registry::Tool;
-use echo_module_sdk::echo_module_api::{CommandContribution, Contribution, TextBlockContribution};
+use echo_module_sdk::echo_module_api::{
+    CommandContribution, Contribution, ModuleManifestClaim, TextBlockContribution,
+};
 use echo_module_sdk::{async_trait, HostClient, InvokeOutcome, InvokeRequest, ModuleHandler};
 use serde_json::Value;
 
@@ -41,6 +43,13 @@ use crate::CHECKLIST_COMMANDS;
 
 /// 清单工具名（`Invoke` 的贡献名，与进程内 `Tool::name()` 一致）。
 pub const TOOL_CONTRIBUTION: &str = "checklist";
+
+/// 进程外形态的来源标签。
+///
+/// `module.toml` 写的是 `inner`（编译进 Core 的那份）。同一份源码打成独立
+/// 二进制后，来源变了——面板分组读的就是这个字段，继续用 `inner` 会让用户
+/// 以为它随 Core 发布。
+pub const EXTERNAL_TAG: &str = "outside";
 
 /// 摘要块在提示词里的排序权重（与进程内 `module.rs` 的声明同值）。
 pub const SUMMARY_BLOCK_ORDER: i32 = 60;
@@ -193,6 +202,33 @@ impl ChecklistModule {
 
 #[async_trait]
 impl ModuleHandler for ChecklistModule {
+    /// 自述身份：与进程内形态那份 `module.toml` **同源**（同一个
+    /// `manifest()`），所以两种形态在面板里是同一行，不会因为运输方式
+    /// 不同而��名字 / 换类别。
+    ///
+    /// 三处刻意的差异（都因为"进程外"这件事本身）：
+    ///
+    /// - `requires` 不声明。`module.toml` 里的 `echo-agent.host.checklist.commands`
+    ///   是**进程内接缝**——组合根注册进 `Ctx` 服务表，模块 mount 时解析。
+    ///   进程外形态下没有 `Ctx` 可查（模块经协议 `HostCall` 回呼），把它照
+    ///   抄过来只会让宿主以为"这个外部模块依赖一个它没注册的键"。
+    /// - `builtin` / `runtime` 不在 claim 里（协议层就没有这两个字段）：
+    ///   由宿主填——同一份二进制可以被 stdio 或 dylib 装进来。
+    /// - `tag` 保留 `inner`？不。见下：进程外形态是**外来的**，面板分组用
+    ///   `outside` 才对；来源是"从模块目录装入"，不是"编译进 Core"。
+    fn manifest_claim(&self) -> Option<ModuleManifestClaim> {
+        // 版本取 crate 自己的版本（独立产物自报家门），不借宿主的版本号。
+        let manifest = crate::manifest(env!("CARGO_PKG_VERSION"));
+        Some(
+            ModuleManifestClaim::new(manifest.id, manifest.kind)
+                .with_name(manifest.name)
+                .with_version(manifest.version)
+                .with_description(manifest.description)
+                .with_tag(EXTERNAL_TAG)
+                .with_author(manifest.author),
+        )
+    }
+
     async fn on_ready(&self, host: HostClient) {
         *self
             .host
@@ -261,5 +297,56 @@ pub fn tool_contribution(tool: &ChecklistTool) -> Contribution {
             "category": "module",
             "package": crate::MODULE_ID,
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 自述身份必须与进程内那份 `module.toml` 对齐：同一份代码的两种形态
+    /// 在面板里是同一行，不能因为运输方式不同而换名字 / 换类别。
+    #[test]
+    fn manifest_claim_matches_the_in_process_manifest() {
+        let module = ChecklistModule::new(std::env::temp_dir());
+        let claim = module.manifest_claim().expect("进程外形态必须自述身份");
+        let inproc = crate::manifest(env!("CARGO_PKG_VERSION"));
+
+        assert_eq!(claim.id, inproc.id);
+        assert_eq!(claim.id, crate::MODULE_ID, "id 是模块的稳定键");
+        assert_eq!(claim.name, inproc.name);
+        assert_eq!(claim.kind, inproc.kind);
+        assert_eq!(claim.description, inproc.description);
+    }
+
+    /// `requires` 刻意不照抄：`module.toml` 里那条是**进程内**接缝（Ctx 服务键），
+    /// 进程外形态没有 Ctx 可查，照抄会让宿主以为外部模块依赖一个没注册的键。
+    #[test]
+    fn manifest_claim_does_not_copy_in_process_service_requires() {
+        let module = ChecklistModule::new(std::env::temp_dir());
+        let claim = module.manifest_claim().expect("claim");
+        assert!(
+            claim.requires.is_empty(),
+            "进程外形态不声明 Ctx 服务依赖（实际：{:?}）",
+            claim.requires
+        );
+        assert!(
+            !crate::manifest(env!("CARGO_PKG_VERSION"))
+                .requires
+                .is_empty(),
+            "前提：module.toml 里确实有 requires —— 否则这条测试在守空气"
+        );
+    }
+
+    /// 来源标签必须是 `outside`：面板分组读它，`inner` 会让人以为随 Core 发布。
+    #[test]
+    fn manifest_claim_marks_the_binary_as_external() {
+        let module = ChecklistModule::new(std::env::temp_dir());
+        assert_eq!(module.manifest_claim().expect("claim").tag, EXTERNAL_TAG);
+        assert_ne!(
+            EXTERNAL_TAG,
+            crate::manifest(env!("CARGO_PKG_VERSION")).tag,
+            "进程内那份是 inner —— 两种形态的来源不同，这正是要区分的原因"
+        );
     }
 }
