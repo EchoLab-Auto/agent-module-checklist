@@ -19,12 +19,12 @@
 
 use std::sync::Arc;
 
-use echo_module::{BuiltinModule, Module, ModuleManifest, ModuleTextBlock, MountContext};
 use echo_module::ServiceSlot;
+use echo_module::{BuiltinModule, Module, ModuleManifest, ModuleTextBlock, MountContext};
 
+use crate::host_keys::command_host_key;
 use crate::provider::{provider_key, ChecklistToolProvider, ChecklistTools};
 use crate::runtime::{runtime_key, ChecklistRuntime};
-use crate::host_keys::command_host_key;
 use crate::{commands, MODULE_ID};
 
 /// 模块声明文件——身份、依赖、提供的服务键全在这里（单一真值）。

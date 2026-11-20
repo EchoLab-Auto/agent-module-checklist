@@ -98,9 +98,7 @@ pub fn provider_key() -> echo_context::ServiceKey<Arc<dyn ChecklistToolProvider>
 ///
 /// 返回 `None` = 模块未挂载（还没挂 / 被禁用）——调用方据此回退
 /// [`standalone_provider`]（与内置工具集、shell 同一个口径）。
-pub fn resolve_provider(
-    ctx: &echo_context::Ctx,
-) -> Option<Arc<dyn ChecklistToolProvider>> {
+pub fn resolve_provider(ctx: &echo_context::Ctx) -> Option<Arc<dyn ChecklistToolProvider>> {
     ctx.service(&provider_key())
 }
 

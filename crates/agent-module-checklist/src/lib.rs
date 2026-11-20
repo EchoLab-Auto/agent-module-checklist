@@ -37,24 +37,21 @@ pub mod module;
 pub mod ops;
 pub mod provider;
 pub mod runtime;
+pub mod serve;
 pub mod store;
 pub mod tool;
 
 /// 模块 id（`module.toml` 与本常量必须一致，单测守着）。
 pub const MODULE_ID: &str = "echo-agent.checklist";
 
-pub use commands::{
-    ChecklistCommandHandler, COMMANDS as CHECKLIST_COMMANDS,
-};
+pub use commands::{ChecklistCommandHandler, COMMANDS as CHECKLIST_COMMANDS};
 pub use host_keys::{command_host_key, ChecklistCommandHost, COMMAND_HOST, TOOLS_PROVIDER};
 pub use module::{manifest, module, MANIFEST_TOML};
 pub use provider::{
     provider_key, resolve_provider, standalone_provider, ChecklistHostCtx, ChecklistPort,
     ChecklistToolProvider, ChecklistTools,
 };
-pub use runtime::{
-    runtime_key, ChecklistFullSnapshot, ChecklistRuntime, TEXT_BLOCK_KEY, ToolGate,
-};
+pub use runtime::{runtime_key, ChecklistFullSnapshot, ChecklistRuntime, ToolGate, TEXT_BLOCK_KEY};
 pub use store::ChecklistStore;
 pub use tool::{
     all_state_event_bindings, state_event_binding, ChecklistTool, ChecklistUnavailableTool,

@@ -13,12 +13,21 @@ echo-context = { workspace = true }
 echo-defs = { workspace = true }
 agent-module-management = { workspace = true }
 async-trait = { workspace = true }
+# 进程外形态（`serve.rs`）：ModuleHandler + serve_stdio。
+echo-module-sdk = { workspace = true }
+# 独立产物入口的日志初始化（stdout 是协议帧独占通道，日志必须走 stderr）。
+tracing-subscriber = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
+
+# 独立产物：`agent-module-checklist` 二进制（`kind = "stdio"` 的宿主条目用它）。
+[[bin]]
+name = "agent-module-checklist"
+path = "src/main.rs"
 
 [dev-dependencies]
 # 假脱敏器（`FakeRedactor`）：测试里要验证"机器字段保留 / 用户内容脱敏"时，

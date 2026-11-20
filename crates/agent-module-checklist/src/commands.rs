@@ -33,8 +33,8 @@ use std::sync::Arc;
 use agent_module_management::protocol::{BackendCommand, BackendEvent};
 use serde_json::Value;
 
-use crate::runtime::ChecklistRuntime;
 use crate::host_keys::ChecklistCommandHost;
+use crate::runtime::ChecklistRuntime;
 
 /// 本命令域处理的名字。
 pub const COMMANDS: [&str; 1] = ["RequestChecklists"];
@@ -48,7 +48,10 @@ pub struct ChecklistCommandHandler {
 impl ChecklistCommandHandler {
     /// `runtime = None` 表示宿主没注册清单运行时（降级路径）：命令会明确
     /// 报错，而不是返回空快照冒充“没有清单”。
-    pub fn new(runtime: Option<Arc<ChecklistRuntime>>, host: Arc<dyn ChecklistCommandHost>) -> Self {
+    pub fn new(
+        runtime: Option<Arc<ChecklistRuntime>>,
+        host: Arc<dyn ChecklistCommandHost>,
+    ) -> Self {
         Self { runtime, host }
     }
 
