@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use echo_defs::registry::Tool;
 use echo_module_sdk::echo_module_api::{CommandContribution, Contribution, TextBlockContribution};
-use echo_module_sdk::{async_trait, InvokeOutcome, InvokeRequest, ModuleHandler};
+use echo_module_sdk::{async_trait, HostClient, InvokeOutcome, InvokeRequest, ModuleHandler};
 use serde_json::Value;
 
 use crate::runtime::{ChecklistRuntime, TEXT_BLOCK_KEY};
@@ -52,14 +52,50 @@ const FALLBACK_SESSION: &str = "__global";
 /// 协议侧清单模块。
 pub struct ChecklistModule {
     runtime: Arc<ChecklistRuntime>,
+    /// `on_ready` 交付的宿主句柄。用它**主动广播**状态变化（`Emit`）——
+    /// 进程内形态走 `state_event_binding` 的同步闭包，进程外没有那条路。
+    host: std::sync::Mutex<Option<HostClient>>,
 }
+
+/// 状态变更事件的线名（面板据此更新清单面板）。
+pub const STATE_EVENT: &str = "checklist.updated";
 
 impl ChecklistModule {
     /// 以数据目录构造。
     pub fn new(data_dir: PathBuf) -> Self {
         Self {
             runtime: Arc::new(ChecklistRuntime::new(data_dir, None)),
+            host: std::sync::Mutex::new(None),
         }
+    }
+
+    /// 广播某会话的最新权威状态。
+    ///
+    /// 载荷形状与进程内 `ChecklistUpdated` **完全一致**（`{session_id,
+    /// team_id, state}`，`state` 带 `epoch`/`revision`）——面板因此能用同一条
+    /// 版本判定逻辑消费两种来源，不必为新形态写第二套。
+    fn broadcast_state(&self, team: &str, session: &str, store: &ChecklistStore) {
+        let Some(host) = self
+            .host
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        else {
+            // 宿主还没交付句柄（`on_ready` 之前）：不报错，调用本就发生在
+            // 握手完成之后，这里只是防御。
+            return;
+        };
+        let Some(state) = store.snapshot(session) else {
+            return;
+        };
+        host.emit(
+            STATE_EVENT,
+            serde_json::json!({
+                "session_id": session,
+                "team_id": team,
+                "state": state,
+            }),
+        );
     }
 
     /// 声明用的工具实例：只读 `name/description/parameters`，用内存 store
@@ -110,10 +146,19 @@ impl ChecklistModule {
         let mut arguments = req.payload;
         if let Value::Object(map) = &mut arguments {
             map.entry("__session_id")
-                .or_insert_with(|| Value::String(session));
+                .or_insert_with(|| Value::String(session.clone()));
         }
-        let tool = ChecklistTool::with_store(store);
-        match tool.execute(arguments).await {
+        let tool = ChecklistTool::with_store(Arc::clone(&store));
+        let outcome = tool.execute(arguments).await;
+        match &outcome {
+            // 只读操作（list/get）不会改状态，广播它们只会让面板白刷一帧。
+            // 判据用"状态确实变了"——`execute` 成功后直接比对没必要，简单点：
+            // 所有成功调用都广播（工具内部已经区分过成功/失败，写操作的
+            // revision 必然 +1，面板的版本判定会丢掉重复帧）。
+            Ok(_) => self.broadcast_state(&team, &session, &store),
+            Err(_) => {}
+        }
+        match outcome {
             Ok(text) => InvokeOutcome::ok(text),
             Err(error) => InvokeOutcome::Error {
                 code: "checklist_failed".to_string(),
@@ -148,6 +193,13 @@ impl ChecklistModule {
 
 #[async_trait]
 impl ModuleHandler for ChecklistModule {
+    async fn on_ready(&self, host: HostClient) {
+        *self
+            .host
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(host);
+    }
+
     fn contributions(&self) -> Vec<Contribution> {
         let tool = Self::declaration_tool();
         let mut contributions = vec![
