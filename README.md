@@ -16,9 +16,9 @@ Core 只保留通用接线（见「宿主侧接线」）。
 | 工具 | `src/tool.rs` | `checklist`（`list` / `create` / `add_items` / `update_item` / `batch` …） |
 | 存储真值 | `src/store.rs` | 版本检查 / 幂等 / 原子写 / 脱敏；per-persona 一份 JSON |
 | 运行时 | `src/runtime.rs` | **per-persona store 的长期所有者**（人格重建复用同一 `Arc`） |
-| 权威补拉 | `src/commands.rs` | `RequestChecklists` → `ChecklistUpdated` / `ChecklistsSnapshot` |
+| 权威补拉 | `src/commands.rs` | 方法 `checklist.snapshot`（面板经通用调用通道点名）→ 快照 JSON |
 | 提示词摘要 | `src/runtime.rs` | 模块文本块（键 `tools.builtin.checklist`） |
-| 装配契约 | `src/provider.rs` | 宿主给端口，模块造工具并打自己的包标签 |
+| 面板界面 | `panel-ui/` | Panel 扩展：入口按钮 + 覆盖层 + 投影（壳里没有清单代码） |
 
 ## 状态协议（第二版）
 
@@ -54,53 +54,72 @@ Core 只保留通用接线（见「宿主侧接线」）。
 `tests.rs` 里的 `cross_process_stale_writer_is_rejected` 通过启动自身测试二进制来真打
 这条不变量（`--ignored --exact tool::tests::cross_process_child_rejects_stale_write`）。
 
-## 装配（宿主给端口，模块造工具）
+## 装配（进程外形态）
 
-`ChecklistToolProvider`（服务键 `echo-agent.checklist.tools`）是模块对外的唯一构造
-契约：宿主递 [`ChecklistPort`](crates/agent-module-checklist/src/provider.rs)（持久
-store / 冻结失败 / `None`=内存 store），模块产出打上 `echo-agent.checklist` 包标签的
-工具集。宿主不认识工具名，模块不认识人格表——两边只在端口上相遇。
+进程外形态没有"端口注入"这一层：`serve.rs` 的 `ChecklistModule` 自己构造
+`ChecklistRuntime`（数据目录来自 `Hello.config` 的 `data_dir`，启动时先用环境变量
+或工作目录兜底），把工具、摘要文本块与快照方法作为 `Contribution` 报给宿主。
 
-未注入时的降级是**显式**的，不是静默换实现：
+加载失败是**显式**的，不是静默换实现：
 
-| 端口 | 注册的工具 | 语义 |
-|---|---|---|
-| `Ready(store)` | `ChecklistTool` + 持久 store | 生产路径 |
-| `Failed(error)` | `ChecklistUnavailableTool` | 每次调用返回同一可排查错误 |
-| `None` | 内存 store | 单测 / 嵌入式；**绝不**用于磁盘加载失败 |
+| 情形 | 表现 |
+|---|---|
+| store 打开成功 | `checklist` 工具正常读写（持久 store） |
+| 文件损坏 / 未知版本 / 超限 | 工具每次调用返回**同一条可排查错误**，摘要跳过，快照方法回错误 |
+| `data_dir` 没配 | 用启动兜底目录（不报错，但要确认它指向你期望的位置） |
 
 ## 宿主侧接线（EchoAgentCore）
 
-1. Core 的 `Cargo.toml` 加依赖，并在 `[patch]` 里把这几个 crate 拉回本地工作区
-   （否则同一进程会有两份 `Tool` trait）：
+**一句话：宿主不需要任何清单专用代码。** 本模块是"只有二进制、宿主完全不认识"
+的第一个实例——Core 的依赖图里没有它、`BUILTIN_MODULE_IDS` 里没有它、协议里也
+没有它的具名变体。宿主只在 `modules.toml` 里写一行：
 
-   ```toml
-   agent-module-checklist = { git = "https://github.com/EchoLab-Auto/agent-module-checklist", branch = "main" }
+```toml
+[[module]]
+id = "echo-agent.checklist"
+kind = "stdio"
+enabled = true
+command = "/home/me/.local/libexec/echo-agent-core/modules/agent-module-checklist/agent-module-checklist"
 
-   [patch."https://github.com/EchoLab-Auto/EchoAgentCore"]
-   agent-module-checklist = { path = "…" }   # 仅本仓仍以 path 方式引入时
-   ```
+[module.config]
+data_dir = "/home/me/.config/echo-agent-core/checklists"
+```
 
-2. 内置模块目录登记（`source/modules/core/src/builtin_modules.rs`）：
+`data_dir` 不要省：不配的话模块只能用启动时的兜底（`ECHO_CHECKLIST_DATA_DIR`
+环境变量，或进程工作目录下的 `checklists/`）——配置写在那里而实际读另一个目录
+时**不会报错**，只会一直显示空清单。模块在 `configure` 里接收这个键。
 
-   ```rust
-   push_module(&mut catalog, agent_module_checklist::module(version))?;
-   ```
+## 与宿主的三个协议面（都不是专用通道）
 
-3. `source/modules/agent-module-loop/src/modules.rs` 的 `BUILTIN_MODULE_IDS` 加
-   `CHECKLIST_MODULE_ID`；`scripts/update.sh` 的 `expected_ids` 加
-   `echo-agent.checklist`（两边一致性由 `instance_manifests` 单测守护）。
+| 面 | 协议 | 谁定义形状 |
+|---|---|---|
+| 工具 | `Contribution::Custom{kind:"echo-agent.tool"}` | 本模块（宿主用 `RemoteTool` 适配进注册表） |
+| 摘要 | `Contribution::Text` + `text_block_content` | 本模块（宿主只按 `order` 排进提示词） |
+| 快照方法 | `Contribution::Command{name:"checklist.snapshot"}` | 本模块（宿主经通用通道 `InvokeModuleOp` 转发，不认识该方法） |
 
-4. 宿主侧三段接线（缺一不可）：
+状态广播走模块自己的事件名：写入成功后 `Emit("checklist.updated",
+{session_id, team_id, state})` → 宿主的 `BackendEvent::ModuleEvent` 原样转给面板。
+**Core 里没有 `ChecklistUpdated` / `ChecklistsSnapshot` / `RequestChecklists` 这三
+个变体**（2026-11-21 删除）——它们是"宿主替模块定义业务接口"的旧形态。
 
-   | 接缝 | 谁实现 | 作用 |
-   |---|---|---|
-   | 服务键 `echo-agent.host.tools.checklist` | 组合根（进程级 `ChecklistRuntime`） | 摘要文本块 + 快照补拉的唯一数据源 |
-   | 服务键 `echo-agent.host.checklist.commands` | 组合根的 `ChecklistCommandHost` | `resolve_registry`（人格存在性）+ `emit`（面板事件） |
-   | `Tool::state_key` 绑定 | 组合根（`all_state_event_bindings()`） | 执行后把状态广播成 `BackendEvent::ChecklistUpdated` |
+## 面板（`panel-ui/`）
 
-5. `RequestChecklists` 是**命令域**，宿主 `apply_command` 在落内置 match 之前会问一次
-   模块——所以命令名只能出现在本仓的 `commands::COMMANDS` 里。
+本模块自带 Panel UI 扩展，壳里**没有一行清单代码**：
+
+| 面板能力 | 本模块怎么用 |
+|---|---|
+| `entries` | 入口行「清单」按钮；`when` = 模块真的挂载 **且** 当前人格允许用该工具，或本地已有投影 |
+| `overlays` | 点开后的面板内容（`components/ChecklistOverlay.vue`，样式随组件） |
+| `hooks.acceptEvent` | 拦下 `ModuleEvent`（`checklist.updated`）与 `ModuleInvokeResult`（快照应答）自己投影 |
+| `hooks.setup` | 人格 / 会话 / 连接变化时补拉权威快照，重连先清版本基线 |
+
+投影与版本判定在 `checklist-store.ts`（`epoch` 判时间线、`revision` 判新旧、
+空 `states` 也是权威）。装配方式：把本仓的 `panel-ui/` 加进
+`PANEL_UI_EXTENSIONS`（`:` 分隔），Panel 构建期把它编进前端包。
+
+面板与模块之间的契约只有两个字符串：方法名 `checklist.snapshot` 与事件名
+`checklist.updated`（都来自 `commands::SNAPSHOT_METHOD` / `serve::STATE_EVENT`，
+本仓单测锁定）。
 
 模块 id 是 `echo-agent.checklist`（运行期标识，出现在配置 / 面板门控 / 持久化状态
 里），**不随 crate 名变**。
@@ -112,9 +131,8 @@ cargo test                              # 69 单测（+1 忽略：子进程角�
 cargo clippy --all-targets -- -D warnings
 ```
 
-上游 Core `main` 尚未包含清单相关协议时（`RequestChecklists` 等变体还没合入），本仓
-独立构建会失败——把根 `Cargo.toml` 里注释的 `[patch]` 段打开、指向本机 Core 工作区
-即可。
+本仓可以**脱离 Core 独立构建**：根 `Cargo.toml` 只依赖 `echo-fabric-arch`（按 tag）
+与 `agent-module-management`（协议形状），没有 Core 的业务 crate。
 
 框架类型（`echo-module`）按 tag 取自 `echo-fabric-arch`，与 Core 根 `Cargo.toml` 保
 持同一 tag。改框架时要两边同时对齐，否则同一进程里会出现两份 `Box<dyn Module>`。
@@ -129,6 +147,6 @@ EchoAgentCore（echo-defs 词汇 + agent-module-management 协议形状）
 agent-module-checklist        ← 不依赖任何其它能力模块，也不依赖 Core 业务 crate
 ```
 
-宿主接缝由本仓的 `src/host_keys.rs` **自己声明**（`ChecklistCommandHost`），不借用
-`agent-module-tools` 的 `ToolsCommandHost`——模块之间互不依赖是硬纪律
-（见 Core 的 `scripts/deps-policy.txt`）。
+本仓不依赖任何 Core 业务 crate，也不依赖其它能力模块（见 Core 的
+`scripts/deps-policy.txt`）。与宿主之间只有协议面：工具 / 文本块的 `Contribution`、
+通用调用 `InvokeModuleOp`（快照方法）、`Emit`（状态事件）。

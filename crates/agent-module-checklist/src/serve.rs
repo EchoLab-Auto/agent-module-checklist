@@ -39,7 +39,7 @@ use serde_json::Value;
 use crate::runtime::{ChecklistRuntime, TEXT_BLOCK_KEY};
 use crate::store::ChecklistStore;
 use crate::tool::ChecklistTool;
-use crate::CHECKLIST_COMMANDS;
+use crate::commands::{snapshot_payload, SNAPSHOT_METHOD};
 
 /// 清单工具名（`Invoke` 的贡献名，与进程内 `Tool::name()` 一致）。
 pub const TOOL_CONTRIBUTION: &str = "checklist";
@@ -60,7 +60,17 @@ const FALLBACK_SESSION: &str = "__global";
 
 /// 协议侧清单模块。
 pub struct ChecklistModule {
-    runtime: Arc<ChecklistRuntime>,
+    /// 当前运行时。`configure` 可能把它**换掉**（宿主在 `Hello.config` 里
+    /// 给出的 `data_dir` 优先于启动时的兜底目录），所以放进 `Mutex` 而不是
+    /// 直接持 `Arc`。
+    ///
+    /// 为什么必须在 `configure` 里换：数据目录要在**第一个调用之前**确定，
+    /// 而 `Hello.config` 握手后才到——`configure` 正是 SDK 保证的
+    /// "`contributions` 之前调用一次"的那个时点。启动瞬间只能给兜底
+    /// （环境变量或工作目录）。
+    runtime: std::sync::Mutex<Arc<ChecklistRuntime>>,
+    /// 当前生效的数据目录（启动兜底，`configure` 可覆盖）。
+    data_dir: std::sync::Mutex<PathBuf>,
     /// `on_ready` 交付的宿主句柄。用它**主动广播**状态变化（`Emit`）——
     /// 进程内形态走 `state_event_binding` 的同步闭包，进程外没有那条路。
     host: std::sync::Mutex<Option<HostClient>>,
@@ -73,9 +83,23 @@ impl ChecklistModule {
     /// 以数据目录构造。
     pub fn new(data_dir: PathBuf) -> Self {
         Self {
-            runtime: Arc::new(ChecklistRuntime::new(data_dir, None)),
+            runtime: std::sync::Mutex::new(Arc::new(ChecklistRuntime::new(
+                data_dir.clone(),
+                None,
+            ))),
+            data_dir: std::sync::Mutex::new(data_dir),
             host: std::sync::Mutex::new(None),
         }
+    }
+
+    /// 取当前运行时（`configure` 换过就是新的那份）。
+    fn runtime(&self) -> Arc<ChecklistRuntime> {
+        Arc::clone(
+            &self
+                .runtime
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
     /// 广播某会话的最新权威状态。
@@ -142,7 +166,8 @@ impl ChecklistModule {
     /// `__session_id` 取会话——工具侧既有的兼容分支）。
     async fn invoke_tool(&self, req: InvokeRequest) -> InvokeOutcome {
         let (team, session) = Self::identity(&req);
-        let store = match self.runtime.store_for(&team) {
+        let runtime = self.runtime();
+        let store = match runtime.store_for(&team) {
             Ok(store) => store,
             Err(error) => {
                 return InvokeOutcome::Error {
@@ -181,41 +206,81 @@ impl ChecklistModule {
         let (team, session) = Self::identity(req);
         // `None` = 这个上下文下没话说（如该人格禁用了清单）。返回空串，
         // 与宿主侧"丢弃空块"的口径一致——别用错误冒充"没有内容"。
-        InvokeOutcome::ok(self.runtime.summary(&team, &session).unwrap_or_default())
+        InvokeOutcome::ok(self.runtime().summary(&team, &session).unwrap_or_default())
     }
 
-    /// 命令域：`RequestChecklists` 的权威快照补拉。
+    /// 方法 `checklist.snapshot`：权威快照补拉。
+    ///
+    /// 返回的是**本次调用的应答**（`InvokeOutcome::data`），不是宿主事件——
+    /// 面板拿到 `{team_id, epoch, revision, states}` 后自己投影，Core 不知道
+    /// 里面有什么。
     fn invoke_command(&self, req: &InvokeRequest) -> InvokeOutcome {
         let (team, _session) = Self::identity(req);
-        let store = match self.runtime.store_for(&team) {
-            Ok(store) => store,
-            Err(error) => {
-                return InvokeOutcome::Error {
-                    code: "checklist_unavailable".to_string(),
-                    message: error,
-                }
-            }
-        };
-        InvokeOutcome::data(store.full_snapshot())
+        match snapshot_payload(&self.runtime(), &team) {
+            Ok(payload) => InvokeOutcome::data(payload),
+            Err(error) => InvokeOutcome::Error {
+                code: "checklist_unavailable".to_string(),
+                message: error,
+            },
+        }
     }
 }
 
 #[async_trait]
 impl ModuleHandler for ChecklistModule {
+    /// 接收宿主下发配置：`[module.config] data_dir` 决定清单落盘位置。
+    ///
+    /// 为什么这里必须处理而不是只认环境变量：`modules.toml` 的
+    /// `[module.config]` 是部署方**唯一的**配置面（写在这一行里、跟着这一行
+    /// 走），而 `[module.env]` 是给"必须在 exec 之前就知道"的场景留的后门。
+    /// 只认环境变量会得到一个很难查的故障：配置写得没错、模块也起来了，但
+    /// 它读的是工作目录下的另一个目录——面板永远是空的，而且不报错。
+    ///
+    /// `data_dir` 缺省 / 非法时**保留兜底**（构造时给的那个），不是报错：
+    /// 宿主没配这个键是完全合法的用法（模块自己有默认位置）。
+    async fn configure(&self, config: Value) -> Result<(), String> {
+        let dir = config
+            .get("data_dir")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let Some(dir) = dir else {
+            return Ok(());
+        };
+        let dir = PathBuf::from(dir);
+        let mut current = self
+            .data_dir
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // 同一个目录就不重建：重建会丢掉已打开的 store（`Arc` 身份是"同一
+        // 份真值"的凭据，热重载 / 反复 configure 不该换掉它）。
+        if *current == dir {
+            return Ok(());
+        }
+        *current = dir.clone();
+        *self
+            .runtime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Arc::new(ChecklistRuntime::new(dir, None));
+        Ok(())
+    }
+
+
     /// 自述身份：与进程内形态那份 `module.toml` **同源**（同一个
     /// `manifest()`），所以两种形态在面板里是同一行，不会因为运输方式
-    /// 不同而��名字 / 换类别。
+    /// 不同而换名字 / 换类别。
     ///
     /// 三处刻意的差异（都因为"进程外"这件事本身）：
     ///
-    /// - `requires` 不声明。`module.toml` 里的 `echo-agent.host.checklist.commands`
-    ///   是**进程内接缝**——组合根注册进 `Ctx` 服务表，模块 mount 时解析。
-    ///   进程外形态下没有 `Ctx` 可查（模块经协议 `HostCall` 回呼），把它照
-    ///   抄过来只会让宿主以为"这个外部模块依赖一个它没注册的键"。
+    /// - `requires` 不声明。`module.toml` 里的服务键是**进程内接缝**（组合根
+    ///   注册进 `Ctx` 服务表，模块 mount 时解析）。进程外形态下没有 `Ctx` 可查
+    ///   （模块经协议 `HostCall` 回呼），把它照抄过来只会让宿主以为"这个外部
+    ///   模块依赖一个它没注册的键"。
     /// - `builtin` / `runtime` 不在 claim 里（协议层就没有这两个字段）：
     ///   由宿主填——同一份二进制可以被 stdio 或 dylib 装进来。
-    /// - `tag` 保留 `inner`？不。见下：进程外形态是**外来的**，面板分组用
-    ///   `outside` 才对；来源是"从模块目录装入"，不是"编译进 Core"。
+    /// - `tag` 不照抄 `inner`：进程外形态是**外来的**，面板分组用 `outside`
+    ///   才对；来源是"从模块目录装入"，不是"编译进 Core"。
     fn manifest_claim(&self) -> Option<ModuleManifestClaim> {
         // 版本取 crate 自己的版本（独立产物自报家门），不借宿主的版本号。
         let manifest = crate::manifest(env!("CARGO_PKG_VERSION"));
@@ -249,12 +314,12 @@ impl ModuleHandler for ChecklistModule {
             }),
         ];
         // ── 命令域 ──
-        for name in CHECKLIST_COMMANDS {
-            contributions.push(Contribution::Command(CommandContribution {
-                name: name.to_string(),
-                description: String::new(),
-            }));
-        }
+        // 面板经通用调用通道点名的方法（`InvokeModuleOp.method`）。名字是
+        // 本模块的词汇：宿主不认识它，Core 的协议里没有对应的具名变体。
+        contributions.push(Contribution::Command(CommandContribution {
+            name: SNAPSHOT_METHOD.to_string(),
+            description: "权威清单快照（{team_id, epoch, revision, states}）".to_string(),
+        }));
         contributions
     }
 
@@ -268,7 +333,7 @@ impl ModuleHandler for ChecklistModule {
         if name == TEXT_BLOCK_KEY {
             return self.invoke_summary(&req);
         }
-        if CHECKLIST_COMMANDS.contains(&name) {
+        if name == SNAPSHOT_METHOD {
             return self.invoke_command(&req);
         }
         InvokeOutcome::Error {
@@ -319,10 +384,10 @@ mod tests {
         assert_eq!(claim.description, inproc.description);
     }
 
-    /// `requires` 刻意不照抄：`module.toml` 里那条是**进程内**接缝（Ctx 服务键），
-    /// 进程外形态没有 Ctx 可查，照抄会让宿主以为外部模块依赖一个没注册的键。
+    /// 进程外形态**不声明** Ctx 服务依赖：`module.toml` 里没有 requires，
+    /// claim 里也不能凭空出现（宿主会以为它缺依赖、拒绝或延迟挂载）。
     #[test]
-    fn manifest_claim_does_not_copy_in_process_service_requires() {
+    fn manifest_claim_declares_no_service_dependencies() {
         let module = ChecklistModule::new(std::env::temp_dir());
         let claim = module.manifest_claim().expect("claim");
         assert!(
@@ -330,12 +395,48 @@ mod tests {
             "进程外形态不声明 Ctx 服务依赖（实际：{:?}）",
             claim.requires
         );
+        assert!(claim.optional_requires.is_empty());
+        assert!(claim.provides.is_empty());
+    }
+
+    /// `configure` 给出的 `data_dir` 真的换掉了运行时：只认环境变量会得到
+    /// "配置写了、模块也起来了、读的却是另一个目录"的静默故障。
+    #[tokio::test]
+    async fn configure_switches_the_data_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "echo-checklist-configure-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let module = ChecklistModule::new(root.join("fallback"));
+        module
+            .configure(serde_json::json!({ "data_dir": root.join("configured").to_string_lossy() }))
+            .await
+            .expect("合法配置不该被拒绝");
+        // 写入一份该目录下的清单，再从快照里读回来：路径生效 = 看到数据。
+        let runtime = module.runtime();
+        let store = runtime.store_for("alix").expect("store 可打开");
+        store
+            .apply(
+                "probe-session",
+                serde_json::json!({ "operation": "create", "name": "probe" }),
+            )
+            .await
+            .expect("创建清单");
+        let payload = crate::commands::snapshot_payload(&runtime, "alix").expect("快照");
+        assert_eq!(payload["states"][0]["state"]["lists"][0]["name"], "probe");
         assert!(
-            !crate::manifest(env!("CARGO_PKG_VERSION"))
-                .requires
-                .is_empty(),
-            "前提：module.toml 里确实有 requires —— 否则这条测试在守空气"
+            root.join("configured").exists(),
+            "数据必须落在 configure 给的目录，而不是启动兜底"
         );
+        assert!(
+            !root.join("fallback").exists(),
+            "兜底目录不该被创建"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// 来源标签必须是 `outside`：面板分组读它，`inner` 会让人以为随 Core 发布。
@@ -343,10 +444,6 @@ mod tests {
     fn manifest_claim_marks_the_binary_as_external() {
         let module = ChecklistModule::new(std::env::temp_dir());
         assert_eq!(module.manifest_claim().expect("claim").tag, EXTERNAL_TAG);
-        assert_ne!(
-            EXTERNAL_TAG,
-            crate::manifest(env!("CARGO_PKG_VERSION")).tag,
-            "进程内那份是 inner —— 两种形态的来源不同，这正是要区分的原因"
-        );
+        assert_eq!(EXTERNAL_TAG, "outside");
     }
 }

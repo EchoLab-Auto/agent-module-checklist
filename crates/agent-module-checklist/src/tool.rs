@@ -14,8 +14,10 @@
 //! - 旧式 `add` / `check` / `uncheck` / `remove` / `reset` 临时兼容，
 //!   其中**按位置修改**必须同时带 `expected_epoch` 和 `expected_revision`，否则明确报错。
 //!
-//! 旧状态广播绑定（[`state_event_binding`] / [`all_state_event_bindings`]）
-//! 保持不变：执行链只认 `state_key()`，线上事件形状仍由本模块声明。
+//! 状态广播：本模块**不再**向宿主注册"状态 key → 宿主事件"的绑定。进程外
+//! 形态自己经 `Emit("checklist.updated", {session_id, team_id, state})` 主动
+//! 广播；面板订阅的是这个模块事件名，不是宿主的具名事件。`state_key()` 仍
+//! 保留给执行链判"这次调用产生了可见状态"。
 
 use std::sync::Arc;
 
@@ -26,37 +28,6 @@ use echo_defs::registry::{Tool, ToolError};
 
 pub use crate::store::ChecklistStore;
 
-/// 本工具状态 key → 线上事件的**绑定声明**（由本模块给出，2026-11 S7）。
-///
-/// 为什么在模块里：`Tool::state_key` 是本工具声明"我有可见状态"，而"这状态
-/// 长什么线上事件"是**协议形状**——把两者放在一起，新增一个有状态面板的
-/// 工具就只需要：实现 `state_key` + 提供一个绑定。执行链与组合根都不参与。
-pub fn state_event_binding() -> (
-    &'static str,
-    agent_module_management::protocol::ToolStateEventBuilder,
-) {
-    (
-        "checklist",
-        std::sync::Arc::new(|session_id: &str, state: &serde_json::Value| {
-            agent_module_management::protocol::BackendEvent::ChecklistUpdated {
-                session_id: session_id.to_string(),
-                state: state.clone(),
-                team_id: None, // annotate_team 统一补
-            }
-        }),
-    )
-}
-
-/// 本 crate 声明的**全部**状态绑定（组合根遍历它注册）。
-///
-/// 只有一个元素（清单）也保留成"列表"：新增第二个有状态工具时，改的是这个
-/// 函数，而不是组合根。
-pub fn all_state_event_bindings() -> Vec<(
-    &'static str,
-    agent_module_management::protocol::ToolStateEventBuilder,
-)> {
-    vec![state_event_binding()]
-}
 
 /// 清单存储加载失败时注册的同名工具：**显式失败**，不伪造空清单。
 ///

@@ -1,0 +1,4 @@
+{
+  "id": "echo-agent.checklist",
+  "entry": "./index.ts"
+}

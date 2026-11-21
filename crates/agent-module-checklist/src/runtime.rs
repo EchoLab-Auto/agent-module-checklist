@@ -38,7 +38,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
-use agent_module_management::protocol::{BackendEvent, ChecklistSnapshotEntry};
 use echo_defs::sanitize::Redactor;
 
 use crate::store::ChecklistStore;
@@ -205,36 +204,10 @@ impl ChecklistRuntime {
     /// 某人格全部会话的权威状态表（空表也合法）。
     ///
     /// 只是 [`full_snapshot`](Self::full_snapshot) 的 `states` 切片视图；
-    /// 要发快照事件请走 [`snapshot_event`](Self::snapshot_event)（版本在事件
-    /// 顶层，只拿 states 会丢掉判新旧所需的版本）。
+    /// 要交给面板请走 [`crate::commands::snapshot_payload`]（版本在载荷顶层，
+    /// 只拿 states 会丢掉判新旧所需的版本）。
     pub fn snapshots(&self, team_id: &str) -> Result<Vec<ChecklistSnapshotEntry>, String> {
         Ok(self.full_snapshot(team_id)?.states)
-    }
-
-    /// 某人格的权威快照事件（`RequestState` 启动补全用）。
-    ///
-    /// **失败 = 显式错误事件**，既不是 `None` 也不空快照：空快照会清掉面板
-    /// 旧投影并掩盖“文件坏了”。签名保持 `Option`（调用侧 `filter_map`
-    /// 不必为错误单独分支），当前实现的结果集是「成功快照」与「显式错误」。
-    pub fn snapshot_event(&self, team_id: &str) -> Option<BackendEvent> {
-        match self.full_snapshot(team_id) {
-            Ok(full) => Some(BackendEvent::ChecklistsSnapshot {
-                team_id: team_id.to_string(),
-                epoch: full.epoch,
-                revision: full.revision,
-                states: full.states,
-            }),
-            Err(error) => {
-                tracing::error!(
-                    team = %team_id, %error,
-                    "checklist snapshot failed; emitting explicit error event"
-                );
-                Some(BackendEvent::Error {
-                    session_id: None,
-                    message: format!("智能体 {team_id} 的清单快照不可用：{error}"),
-                })
-            }
-        }
     }
 
     /// 某人格 / 某会话的限额摘要；工具当前不可用时返回 `None`。
@@ -283,6 +256,19 @@ impl ChecklistRuntime {
             .map(|gate| gate(team_id, tool_name))
             .unwrap_or(true)
     }
+}
+
+/// 一个会话的权威状态（本模块自己的线形状，**不借宿主的类型**）。
+///
+/// 以前这个类型住在宿主的 `BackendEvent::ChecklistSnapshotEntry` 里——那等于
+/// 让宿主替模块定义"清单长什么样"。模块外置之后，形状归模块：宿主只搬运
+/// JSON，不认识 `session_id` / `state` 这两件事。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ChecklistSnapshotEntry {
+    /// 归属会话 id（含通道前缀，如 `local:tui::local_user`）。
+    pub session_id: String,
+    /// 该会话的权威清单状态（`{lists, epoch, revision}`）。
+    pub state: serde_json::Value,
 }
 
 /// 一次一致读的全量快照：文件级 `epoch` / `revision` + 各会话权威状态。
@@ -531,82 +517,6 @@ mod tests {
         assert!(!summary.contains("plain"));
     }
     #[test]
-    fn snapshot_event_is_authoritative_even_when_empty_and_carries_version() {
-        let runtime = ChecklistRuntime::memory();
-        let store = runtime.store_for("alix").unwrap();
-        let event = runtime.snapshot_event("alix").expect("不存在的会话=空快照");
-        match event {
-            BackendEvent::ChecklistsSnapshot {
-                team_id,
-                epoch,
-                revision,
-                states,
-                ..
-            } => {
-                assert_eq!(team_id, "alix");
-                assert!(states.is_empty());
-                assert_eq!(revision, 0, "空 store 的 revision 是 0，但仍然必须带版本");
-                assert_eq!(
-                    epoch,
-                    store.full_snapshot()["epoch"].as_str().unwrap(),
-                    "事件的 epoch 必须来自 store 的同一次全量快照"
-                );
-                assert!(!epoch.is_empty(), "空 states 也必须有 epoch（UUID）");
-            }
-            other => panic!("unexpected event: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn snapshot_event_version_matches_the_same_store_read_as_states() {
-        let runtime = ChecklistRuntime::memory();
-        let store = runtime.store_for("alix").unwrap();
-        store
-            .apply(
-                "s1",
-                serde_json::json!({"operation": "create", "name": "p", "items": ["a", "b"]}),
-            )
-            .await
-            .unwrap();
-        let full = runtime.full_snapshot("alix").unwrap();
-        let raw = store.full_snapshot();
-        assert_eq!(full.epoch, raw["epoch"].as_str().unwrap());
-        assert_eq!(full.revision, raw["revision"].as_u64().unwrap());
-        assert!(full.revision > 0, "一次成功修改必须推进 revision");
-        assert_eq!(full.states.len(), 1);
-        let entry = &full.states[0];
-        assert_eq!(entry.session_id, "s1", "会话 id 取自 sessions[].session");
-        assert!(
-            entry.state.get("session").is_none(),
-            "state 与 ChecklistUpdated.state 同口径，不含 session 键"
-        );
-        assert_eq!(
-            entry.state["revision"].as_u64(),
-            Some(full.revision),
-            "条目的版本与顶层版本来自同一次读取"
-        );
-        assert_eq!(entry.state["lists"][0]["name"], "p");
-
-        // 事件与 full_snapshot 同源：版本、states 完全一致。
-        match runtime.snapshot_event("alix").unwrap() {
-            BackendEvent::ChecklistsSnapshot {
-                team_id,
-                epoch,
-                revision,
-                states,
-                ..
-            } => {
-                assert_eq!(team_id, "alix");
-                assert_eq!(epoch, full.epoch);
-                assert_eq!(revision, full.revision);
-                assert_eq!(states.len(), full.states.len());
-                assert_eq!(states[0].session_id, "s1");
-            }
-            other => panic!("unexpected event: {other:?}"),
-        }
-    }
-
-    #[test]
     fn broken_file_emits_explicit_error_event_not_an_authoritative_empty() {
         let root = temp_root("broken-event");
         let path = store_path(&root, "alix").unwrap();
@@ -618,22 +528,13 @@ mod tests {
         assert!(runtime.full_snapshot("alix").is_err());
         assert!(runtime.snapshots("alix").is_err());
 
-        // 启动补全走显式错误事件：绝不发“看起来权威”的空快照。
-        match runtime.snapshot_event("alix") {
-            Some(BackendEvent::Error {
-                session_id,
-                message,
-            }) => {
-                assert!(session_id.is_none(), "人格级故障不是某个会话的错误");
-                assert!(message.contains("alix"), "{message}");
-                assert!(message.contains("不可用"), "{message}");
-                assert!(
-                    message.contains("拒绝以空清单覆盖"),
-                    "错误必须可排查（带加载失败原因）: {message}"
-                );
-            }
-            other => panic!("坏文件必须发显式 Error 事件，实际: {other:?}"),
-        }
+        // 面板取快照的入口同样走错误通道：绝不返回“看起来权威”的空快照。
+        let error = crate::commands::snapshot_payload(&runtime, "alix")
+            .expect_err("坏文件必须回显式错误，而不是空快照");
+        assert!(
+            error.contains("拒绝以空清单覆盖"),
+            "错误必须可排查（带加载失败原因）: {error}"
+        );
         assert_eq!(
             std::fs::read(&path).unwrap(),
             before,
