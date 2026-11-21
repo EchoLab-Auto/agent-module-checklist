@@ -208,11 +208,15 @@ export function resetForReconnect(): void {
   bump();
 }
 
-/** 请求权威快照。`team` 必填（人格是清单的归属单位）。 */
+/** 请求权威快照。`team` 必填（人格是清单的归属单位）。
+ *
+ * 拉的是**整人格**快照（`states` 是完整集合），会话过滤在本地做：权威语义
+ * 要求"不在快照里的会话 = 没有清单"，只拉单个会话就判不出这一点。
+ */
 export function requestSnapshot(
   core: string | null | undefined,
   team: string | null,
-  session: string | null,
+  _session: string | null,
 ): void {
   if (!team) return;
   const key = personaKey(core, team);
@@ -220,10 +224,12 @@ export function requestSnapshot(
   // 轻节流：hover / 打开 / 切会话可能连着触发，短时间内只发一次。
   if (lastRequest && lastRequest.key === key && now - lastRequest.at < 500) return;
   lastRequest = { key, at: now };
-  const payload: Record<string, unknown> = { team_id: team };
-  if (session && session !== 'global') payload.session_id = session;
   sendCommand({
-    InvokeModuleOp: { module: MODULE_ID, method: SNAPSHOT_METHOD, payload },
+    InvokeModuleOp: {
+      module: MODULE_ID,
+      method: SNAPSHOT_METHOD,
+      payload: { team_id: team },
+    },
   });
 }
 
