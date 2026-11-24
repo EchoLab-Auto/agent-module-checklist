@@ -59,6 +59,18 @@ pub const SUMMARY_BLOCK_ORDER: i32 = 60;
 const FALLBACK_SESSION: &str = "__global";
 
 /// 协议侧清单模块。
+/// 面板 UI 贡献的 `Contribution::Custom` 分类名（宿主的词汇）。
+///
+/// 与宿主 `core::panel_ui::PANEL_UI_CONTRIBUTION_KIND` 是同一条字符串契约：
+/// 两侧各写一份字面量，改一边等于本模块的界面入口静默消失。
+pub const PANEL_UI_CONTRIBUTION_KIND: &str = "panel_ui";
+
+/// 本模块面板 UI bundle 的站点相对路径（固定，不带 hash）。
+pub const PANEL_UI_BUNDLE: &str = "panel-extensions/echo-agent.checklist/index.js";
+
+/// 面板 UI SDK 契约版本（与 Panel 仓 `panel-shared.entries.json` 一致）。
+pub const PANEL_UI_SDK_VERSION: &str = "1";
+
 pub struct ChecklistModule {
     /// 当前运行时。`configure` 可能把它**换掉**（宿主在 `Hello.config` 里
     /// 给出的 `data_dir` 优先于启动时的兜底目录），所以放进 `Mutex` 而不是
@@ -320,6 +332,24 @@ impl ModuleHandler for ChecklistModule {
             name: SNAPSHOT_METHOD.to_string(),
             description: "权威清单快照（{team_id, epoch, revision, states}）".to_string(),
         }));
+        // ── 面板 UI 贡献（2026-11）──
+        //
+        // 本模块是**进程外**形态（stdio），拿不到宿主的 `Ctx`，所以不能像
+        // 进程内模块那样直接调 `PanelUiRegistrar`。框架的
+        // `Contribution::Custom { custom_kind, payload }` 是"宿主自定义贡献"的
+        // 官方入口（框架只搬运、不解释），宿主在这里解释 `panel_ui`。
+        //
+        // `name` 承载扩展 id：它本来就参与 `Invoke` 寻址，与扩展 id 是同一个
+        // 字符串。`payload` 形状由本模块与宿主约定。
+        contributions.push(Contribution::Custom {
+            kind: PANEL_UI_CONTRIBUTION_KIND.to_string(),
+            name: crate::MODULE_ID.to_string(),
+            payload: serde_json::json!({
+                "name": "任务清单",
+                "bundle": PANEL_UI_BUNDLE,
+                "sdk_version": PANEL_UI_SDK_VERSION,
+            }),
+        });
         contributions
     }
 
